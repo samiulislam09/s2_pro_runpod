@@ -2,7 +2,7 @@
 Streaming WebSocket TTS worker for Fish Audio S2 Pro (fine-tuned bn_bd) — RunPod Load Balancer endpoint.
 
 Routes
-  GET /ping            health (required by RunPod)
+  GET /ping            health (required by RunPod; served on PORT and, if different, on PORT_HEALTH)
   WS  /ws/tts          streaming text-in / audio-out session
 
 Client -> server (JSON text frames)
@@ -19,13 +19,20 @@ Server -> client
   JSON  {"type":"chunk_end","turn":T,"seq":N}
   JSON  {"type":"turn_done","turn":T}      # everything flushed for this turn has been sent
   JSON  {"type":"error","message":"..."}
+
+Serverless notes
+  The model is loaded on a background thread so the HTTP server is listening (and /ping answering)
+  from the first second of the cold start. /ping reports "starting" until the warm-up finishes and
+  goes unhealthy — without exiting — if the checkpoint is missing or the GPU thread dies, so RunPod
+  recycles the worker instead of routing traffic into a black hole.
 """
-import asyncio, base64, json, os, queue, struct, threading, time
+import asyncio, base64, json, os, queue, struct, sys, threading, time, traceback
 
 import numpy as np
 import torch
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 
 from fish_speech.inference_engine import TTSInferenceEngine
 from fish_speech.models.dac.inference import load_model as load_codec
@@ -33,41 +40,86 @@ from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
 
 CKPT = os.environ.get("CKPT", "/runpod-volume/models/s2-pro-bn-bd")
-import os, sys
-if not os.path.exists(f"{CKPT}/config.json"):
-    print(f"[worker] MODEL NOT FOUND at {CKPT}", flush=True)
-    for d in ("/runpod-volume", "/workspace"):
-        print(f"[worker] {d}:", os.listdir(d) if os.path.exists(d) else "(not mounted)", flush=True)
-    sys.exit(1)
 PORT = int(os.environ.get("PORT", "8000"))
+PORT_HEALTH = int(os.environ.get("PORT_HEALTH", str(PORT)))
 COMPILE = os.environ.get("COMPILE", "1") == "1"
+# RunPod kills workers that fail health checks. If your endpoint's startup grace period is shorter
+# than the cold start (torch.compile can take minutes), set this to 1 so /ping returns 200 while
+# loading; WebSocket connects are still refused until the model is actually ready.
+HEALTH_OK_WHILE_STARTING = os.environ.get("HEALTH_OK_WHILE_STARTING", "0") == "1"
 PRECISION = torch.bfloat16
 
-# ---------------------------------------------------------------- model (loaded once per worker)
-t0 = time.time()
-_llama = launch_thread_safe_queue(checkpoint_path=CKPT, device="cuda", precision=PRECISION, compile=COMPILE)
-_codec = load_codec("modded_dac_vq", f"{CKPT}/codec.pth", device="cuda")
-engine = TTSInferenceEngine(llama_queue=_llama, decoder_model=_codec, precision=PRECISION, compile=COMPILE)
-SAMPLE_RATE = _codec.spec_transform.sample_rate if hasattr(_codec, "spec_transform") else _codec.sample_rate
-# warm-up (also triggers torch.compile if enabled)
-for _ in engine.inference(ServeTTSRequest(text="আমি ঢাকায় থাকি।", format="wav", max_new_tokens=128, streaming=True)):
-    pass
-READY = True
-print(f"[worker] model ready in {time.time()-t0:.1f}s, sr={SAMPLE_RATE}", flush=True)
+# ---------------------------------------------------------------- worker state
+STATUS = "starting"          # starting | healthy | error
+STATUS_DETAIL = "model not loaded yet"
+engine = None
+SAMPLE_RATE = None
 
 # One GPU, one generation at a time. All sessions share this queue.
 _gpu_jobs: "queue.Queue[tuple]" = queue.Queue()
+_gpu_thread: "threading.Thread | None" = None
+
+
+def _fail(detail: str):
+    """Enter a permanent unhealthy state. Do NOT exit: a crash-looping worker is billed for every
+    restart and shows up as a flapping endpoint instead of a diagnosable one."""
+    global STATUS, STATUS_DETAIL
+    STATUS, STATUS_DETAIL = "error", detail
+    print(f"[worker] UNHEALTHY: {detail}", flush=True)
+
+
+# ---------------------------------------------------------------- model (loaded once, off the main thread)
+def _load_model():
+    global STATUS, STATUS_DETAIL, engine, SAMPLE_RATE, _gpu_thread
+
+    if not os.path.exists(f"{CKPT}/config.json"):
+        for d in ("/runpod-volume", "/workspace"):
+            print(f"[worker] {d}:", os.listdir(d) if os.path.exists(d) else "(not mounted)", flush=True)
+        _fail(f"model not found at {CKPT}")
+        return
+
+    try:
+        t0 = time.time()
+        STATUS_DETAIL = "loading checkpoints"
+        llama = launch_thread_safe_queue(checkpoint_path=CKPT, device="cuda", precision=PRECISION, compile=COMPILE)
+        codec = load_codec("modded_dac_vq", f"{CKPT}/codec.pth", device="cuda")
+        eng = TTSInferenceEngine(llama_queue=llama, decoder_model=codec, precision=PRECISION, compile=COMPILE)
+        sr = codec.spec_transform.sample_rate if hasattr(codec, "spec_transform") else codec.sample_rate
+
+        STATUS_DETAIL = "warming up (torch.compile)" if COMPILE else "warming up"
+        for _ in eng.inference(ServeTTSRequest(text="আমি ঢাকায় থাকি।", format="wav", max_new_tokens=128, streaming=True)):
+            pass
+
+        engine, SAMPLE_RATE = eng, sr
+        _gpu_thread = threading.Thread(target=_gpu_worker, name="gpu-worker", daemon=True)
+        _gpu_thread.start()
+        STATUS, STATUS_DETAIL = "healthy", ""
+        print(f"[worker] model ready in {time.time()-t0:.1f}s, sr={sr}", flush=True)
+    except Exception:
+        traceback.print_exc()
+        _fail(f"model load failed: {traceback.format_exc(limit=1).strip()}")
 
 
 def _gpu_worker():
+    """Never dies. A raised exception here used to kill the thread permanently, leaving a worker that
+    still passed health checks but produced silence forever."""
     while True:
         session, turn, seq, text = _gpu_jobs.get()
-        if session.closed or turn < session.cancel_floor:   # cancelled / stale
-            continue
-        session.run_chunk(turn, seq, text)
+        try:
+            if session.closed or turn < session.cancel_floor:   # cancelled / stale
+                continue
+            session.run_chunk(turn, seq, text)
+        except Exception:
+            traceback.print_exc()
+            try:
+                session.send_error(f"generation failed: {sys.exc_info()[1]}")
+            except Exception:
+                pass
 
 
-threading.Thread(target=_gpu_worker, daemon=True).start()
+def ready() -> bool:
+    return STATUS == "healthy" and _gpu_thread is not None and _gpu_thread.is_alive()
+
 
 # ---------------------------------------------------------------- text chunker
 SENT_END = "।?!.\n"
@@ -186,25 +238,47 @@ class Session:
         _gpu_jobs.put((self, self.turn, self.seq, text))
         self.seq += 1
 
+    def send_error(self, message):
+        self._send_json({"type": "error", "message": message})
+
     def _send_json(self, obj):
+        if self.closed:
+            return
         asyncio.run_coroutine_threadsafe(self.ws.send_text(json.dumps(obj, ensure_ascii=False)), self.loop)
 
     def _send_bytes(self, b):
+        if self.closed:
+            return
         asyncio.run_coroutine_threadsafe(self.ws.send_bytes(b), self.loop)
 
 
 # ---------------------------------------------------------------- app
 app = FastAPI()
+health_app = FastAPI()          # only bound when PORT_HEALTH != PORT
 
 
-@app.get("/ping")
-def ping():
-    return {"status": "healthy" if READY else "starting"}
+def _ping():
+    if ready():
+        return {"status": "healthy", "sample_rate": SAMPLE_RATE}
+    if STATUS == "healthy":     # loaded, but the GPU thread is gone — let RunPod replace this worker
+        return JSONResponse({"status": "unhealthy", "detail": "gpu worker thread died"}, status_code=503)
+    if STATUS == "error":
+        return JSONResponse({"status": "unhealthy", "detail": STATUS_DETAIL}, status_code=503)
+    body = {"status": "starting", "detail": STATUS_DETAIL}
+    return JSONResponse(body, status_code=200 if HEALTH_OK_WHILE_STARTING else 503)
+
+
+app.get("/ping")(_ping)
+health_app.get("/ping")(_ping)
 
 
 @app.websocket("/ws/tts")
 async def ws_tts(ws: WebSocket):
     await ws.accept()
+    if not ready():
+        await ws.send_text(json.dumps({"type": "error", "message": f"worker not ready: {STATUS} {STATUS_DETAIL}".strip()}))
+        await ws.close(code=1013)              # try again later
+        return
     s = Session(ws, asyncio.get_running_loop())
     await ws.send_text(json.dumps({"type": "ready", "sample_rate": SAMPLE_RATE}))
     try:
@@ -237,5 +311,19 @@ async def ws_tts(ws: WebSocket):
         s.closed = True
 
 
+async def _serve():
+    servers = [uvicorn.Server(uvicorn.Config(
+        app, host="0.0.0.0", port=PORT, ws_ping_interval=20, ws_ping_timeout=20,
+    )).serve()]
+    if PORT_HEALTH != PORT:
+        servers.append(uvicorn.Server(uvicorn.Config(
+            health_app, host="0.0.0.0", port=PORT_HEALTH, log_level="warning",
+        )).serve())
+    await asyncio.gather(*servers)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=PORT, ws_ping_interval=20, ws_ping_timeout=20)
+    # Serve first, load second: /ping must answer during the whole cold start.
+    threading.Thread(target=_load_model, name="model-loader", daemon=True).start()
+    print(f"[worker] serving on :{PORT}" + (f", health on :{PORT_HEALTH}" if PORT_HEALTH != PORT else ""), flush=True)
+    asyncio.run(_serve())
