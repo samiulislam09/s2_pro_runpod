@@ -33,6 +33,12 @@ from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
 from fish_speech.utils.schema import ServeReferenceAudio, ServeTTSRequest
 
 CKPT = os.environ.get("CKPT", "/runpod-volume/models/s2-pro-bn-bd")
+import os, sys
+if not os.path.exists(f"{CKPT}/config.json"):
+    print(f"[worker] MODEL NOT FOUND at {CKPT}", flush=True)
+    for d in ("/runpod-volume", "/workspace"):
+        print(f"[worker] {d}:", os.listdir(d) if os.path.exists(d) else "(not mounted)", flush=True)
+    sys.exit(1)
 PORT = int(os.environ.get("PORT", "8000"))
 COMPILE = os.environ.get("COMPILE", "1") == "1"
 PRECISION = torch.bfloat16
