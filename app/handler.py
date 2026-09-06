@@ -46,7 +46,6 @@ COMPILE = os.environ.get("COMPILE", "1") == "1"
 # RunPod kills workers that fail health checks. If your endpoint's startup grace period is shorter
 # than the cold start (torch.compile can take minutes), set this to 1 so /ping returns 200 while
 # loading; WebSocket connects are still refused until the model is actually ready.
-HEALTH_OK_WHILE_STARTING = os.environ.get("HEALTH_OK_WHILE_STARTING", "0") == "1"
 PRECISION = torch.bfloat16
 
 # ---------------------------------------------------------------- worker state
@@ -265,7 +264,7 @@ def _ping():
     if STATUS == "error":
         return JSONResponse({"status": "unhealthy", "detail": STATUS_DETAIL}, status_code=503)
     body = {"status": "starting", "detail": STATUS_DETAIL}
-    return JSONResponse(body, status_code=200 if HEALTH_OK_WHILE_STARTING else 503)
+    return JSONResponse(body, status_code=200)
 
 
 app.get("/ping")(_ping)
