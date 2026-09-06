@@ -25,4 +25,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 COPY handler.py /app/handler.py
-CMD ["python", "-u", "/handler.py"]
+CMD ["python", "-u", "/app/handler.py"]
