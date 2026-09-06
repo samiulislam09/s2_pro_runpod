@@ -1,0 +1,8 @@
+# fish-speech itself is installed from GitHub in the Dockerfile (not on PyPI).
+# These are the extras the worker needs on top of it.
+fastapi>=0.115
+uvicorn[standard]>=0.30
+websockets>=12
+protobuf>=3.20,<6
+huggingface_hub[cli]
+hf_transfer
